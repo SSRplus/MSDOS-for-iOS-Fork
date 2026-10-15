@@ -1,0 +1,189 @@
+name: Build DOSPad IPA (from project zip)
+
+# วิธีใช้ (ทำจากมือถือได้ทั้งหมด):
+#  1) อัปโหลดไฟล์ DOSPad-1.0-full-project.zip ขึ้น repo (Add file > Upload files)
+#  2) สร้างไฟล์ .github/workflows/build-ipa-from-zip.yml แล้ววางโค้ดนี้
+#  3) แท็บ Actions > Build DOSPad IPA (from project zip) > Run workflow
+#  4) ได้ไฟล์ .ipa / .tipa ทั้งใน Artifacts และหน้า Releases (ดาวน์โหลดจากมือถือได้เลย)
+# workflow นี้แตก zip ใน repo เองอัตโนมัติ ไม่ต้องแตกไฟล์/อัปทีละไฟล์
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "path ของไฟล์ zip ใน repo (เว้นว่าง = หา .zip ใน repo เอง)"
+        required: false
+        default: ""
+      publish_release:
+        description: "สร้าง Release พร้อมไฟล์ IPA (ดาวน์โหลดง่ายบนมือถือ)"
+        required: false
+        type: boolean
+        default: true
+  push:
+    paths:
+      - "**.zip"
+      - ".github/workflows/build-ipa-from-zip.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find and unpack the project
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/src"
+          rm -rf "$WORK" && mkdir -p "$WORK"
+
+          ZIP="${{ github.event.inputs.zip_path }}"
+          if [ -z "$ZIP" ]; then
+            # use the biggest .zip in the repo (the project archive)
+            ZIP=$(find . -maxdepth 4 -iname '*.zip' -not -path './.git/*' -not -path './.github/*' -type f -printf '%s %p\n' | sort -rn | head -n 1 | cut -d' ' -f2- || true)
+          fi
+
+          if [ -n "$ZIP" ] && [ -f "$ZIP" ]; then
+            echo "Using zip: $ZIP"
+            unzip -q -o "$ZIP" -d "$WORK"
+          elif [ -d "dospad.xcodeproj" ]; then
+            echo "No zip found - using the project files that are already in the repo"
+            cp -R . "$WORK/"
+          else
+            echo "::error::ไม่พบไฟล์ .zip ของโปรเจกต์ใน repo (อัปโหลด DOSPad-1.0-full-project.zip ก่อน)"
+            exit 1
+          fi
+
+          PROJ=$(find "$WORK" -maxdepth 5 -name 'dospad.xcodeproj' -not -path '*/__MACOSX/*' | head -n 1)
+          if [ -z "$PROJ" ]; then
+            echo "::error::ไม่พบ dospad.xcodeproj ใน zip"
+            exit 1
+          fi
+          DIR=$(dirname "$PROJ")
+          echo "Project dir: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          rm -rf "$WORK/__MACOSX" || true
+
+      - name: Select Xcode
+        run: |
+          ls /Applications | grep -i "^Xcode" || true
+          if [ -d /Applications/Xcode_15.4.app ]; then sudo xcode-select -s /Applications/Xcode_15.4.app; fi
+          xcodebuild -version
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Make sure the project includes all new sources (idempotent)
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          if [ -f tools/patch_pbxproj.py ]; then python3 tools/patch_pbxproj.py; fi
+
+      - name: Build (Release, iphoneos, arm64, no signing)
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project dospad.xcodeproj \
+            -target dospad \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=14.0 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" \
+            ENABLE_BITCODE=NO \
+            GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+            OTHER_CFLAGS="-Wno-everything" \
+            SYMROOT="$PWD/build" \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 40
+
+      - name: Package .ipa / .tipa
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: |
+          set -euo pipefail
+          APP=$(find build -name "dospad.app" -maxdepth 3 -type d | head -n 1)
+          test -d "$APP" || { echo "::error::build ไม่สร้าง dospad.app"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Info.plist" 2>/dev/null || echo 1.0)
+
+          # entitlements for the TrollStore build (use the project's file when present)
+          if [ -f entitlements/TrollStore.entitlements ]; then
+            cp entitlements/TrollStore.entitlements "$RUNNER_TEMP/troll.entitlements"
+          else
+            cat > "$RUNNER_TEMP/troll.entitlements" <<'ENT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>get-task-allow</key><true/>
+            <key>dynamic-codesigning</key><true/>
+            <key>com.apple.security.cs.allow-jit</key><true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+            <key>platform-application</key><true/>
+            <key>com.apple.private.security.no-sandbox</key><true/>
+            <key>com.apple.private.security.container-required</key><false/>
+          </dict>
+          </plist>
+          ENT
+          fi
+
+          # 1) sideload IPA: left unsigned, SideStore / AltStore / Sideloadly sign it
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/DOSPad.app
+          zip -qry "$GITHUB_WORKSPACE/dist/DOSPad-${VERSION}-sideload.ipa" Payload
+
+          # 2) TrollStore: fake-signed with JIT / no-sandbox entitlements
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/DOSPad.app
+          EXE=$(/usr/libexec/PlistBuddy -c "Print CFBundleExecutable" Payload/DOSPad.app/Info.plist)
+          ldid -S"$RUNNER_TEMP/troll.entitlements" "Payload/DOSPad.app/$EXE"
+          zip -qry "$GITHUB_WORKSPACE/dist/DOSPad-${VERSION}-trollstore.tipa" Payload
+          cp "$GITHUB_WORKSPACE/dist/DOSPad-${VERSION}-trollstore.tipa" "$GITHUB_WORKSPACE/dist/DOSPad-${VERSION}-trollstore.ipa"
+          ls -la "$GITHUB_WORKSPACE/dist"
+
+      - name: Show compiler errors in the run summary
+        if: failure()
+        run: |
+          {
+            echo "### Build errors"
+            echo '```'
+            grep -E "error:|fatal error|ld: " build.log | head -n 40 || tail -n 40 build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: DOSPad-IPA
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Publish release (download from your phone)
+        if: success() && (github.event_name == 'push' || github.event.inputs.publish_release == 'true')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: DOSPad build ${{ github.run_number }}
+          prerelease: true
+          files: dist/*
+          body: |
+            ไฟล์ติดตั้ง DOSPad (สร้างอัตโนมัติจาก zip ใน repo)
+            - `*-trollstore.ipa` / `.tipa` → TrollStore
+            - `*-sideload.ipa` → SideStore / AltStore / Sideloadly
